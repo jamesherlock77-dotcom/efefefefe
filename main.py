@@ -1,25 +1,40 @@
 import asyncio
 import json
 import os
+import re
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 
-# Override these in Railway variables if Meta rotates them.
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "OC|752908224809889|")
-APP_ID = int(os.environ.get("APP_ID", "7190422614401072"))  # Animal Company
-DOCID = os.environ.get("DOCID", "6771539532935162")
-
-URL = "https://graph.oculus.com/graphql"
+GAME_NAME = os.environ.get("GAME_NAME", "Animal Company")
+STORE_URL = os.environ.get(
+    "STORE_URL",
+    "https://www.meta.com/en-gb/experiences/animal-company/7190422614401072/",
+)
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))  # default: 10 minutes
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 # On Railway, attach a Volume so state survives redeploys. Railway sets
 # RAILWAY_VOLUME_MOUNT_PATH automatically when a volume is attached.
 STATE_FILE = Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", ".")) / "state.json"
+
+# The store page embeds the app's data as JSON, e.g.
+#   ..."version":"1.99.5.4078","version_code":4078,...
+VERSION_RE = re.compile(r'"version":"(\d+(?:\.\d+)+)","version_code":(\d+)')
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+}
 
 sys.stdout.reconfigure(line_buffering=True)  # show logs immediately on Railway
 
@@ -28,40 +43,31 @@ def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def payload() -> dict:
-    return {
-        "access_token": ACCESS_TOKEN,
-        "variables": json.dumps({"applicationID": str(APP_ID)}),
-        "doc_id": str(DOCID),
-    }
-
-
-async def fetch_metadata(session: aiohttp.ClientSession) -> Optional[dict]:
+async def fetch_version(session: aiohttp.ClientSession) -> Optional[str]:
     try:
-        async with session.post(URL, data=payload()) as resp:
-            if resp.status >= 400:
-                body = (await resp.text())[:500]
-                print(f"[{now()}] HTTP {resp.status} from Meta: {body}")
-                return None
-            data = await resp.json(content_type=None)
-            return data if isinstance(data, dict) else None
+        async with session.get(STORE_URL, headers=HEADERS) as resp:
+            status = resp.status
+            html = await resp.text()
     except Exception as e:
         print(f"[{now()}] Request failed: {type(e).__name__}: {e}")
         return None
 
-
-def live_version(meta: dict) -> Optional[str]:
-    nodes = (meta.get("data") or {}).get("node", {}).get("liveChannel", {}).get("nodes", [])
-    if not nodes:
+    if status != 200:
+        print(f"[{now()}] HTTP {status} from store page: {html[:300]!r}")
         return None
-    return (nodes[0].get("latest_supported_binary") or {}).get("version")
 
-
-def dev_version(meta: dict) -> Optional[str]:
-    nodes = (meta.get("data") or {}).get("node", {}).get("primary_binaries", {}).get("nodes", [])
-    if not nodes:
+    matches = VERSION_RE.findall(html)
+    if not matches:
+        print(f"[{now()}] No version found in page (HTTP {status}, {len(html)} chars)")
         return None
-    return nodes[0].get("version")
+
+    # The app's own binary shows up several times; pick the most common pair
+    # in case the page also embeds other apps' data.
+    counts = Counter(matches)
+    (version, _code), _n = counts.most_common(1)[0]
+    if len(counts) > 1:
+        print(f"[{now()}] Multiple version candidates, using {version}: {dict(counts)}")
+    return version
 
 
 def load_state() -> dict:
@@ -87,40 +93,31 @@ async def notify(session: aiohttp.ClientSession, message: str) -> None:
 
 
 async def check_once(session: aiohttp.ClientSession) -> None:
-    meta = await fetch_metadata(session)
-    if meta is None:
+    version = await fetch_version(session)
+    if version is None:
         return
 
-    current = {"live": live_version(meta), "dev": dev_version(meta)}
-
-    if not any(current.values()):
-        # Request worked but the response shape didn't match: show it so we can adapt.
-        print(f"[{now()}] No versions found. Response: {json.dumps(meta)[:1500]}")
-        return
     state = load_state()
+    old = state.get("live")
 
     # First run: record a baseline.
-    if not state:
-        save_state(current)
-        await notify(
-            session,
-            f"Now tracking app {APP_ID}. Current versions: live={current['live']} dev={current['dev']}",
-        )
+    if not old:
+        save_state({"live": version})
+        await notify(session, f"Now tracking {GAME_NAME}. Current version: {version}")
         return
 
-    for channel, new in current.items():
-        old = state.get(channel)
-        if new and new != old:
-            await notify(session, f"App {APP_ID} {channel} version changed: {old} -> {new}")
-            state[channel] = new
-
-    save_state(state)
+    if version != old:
+        await notify(
+            session,
+            f"{GAME_NAME} updated: {old} -> {version}\n{STORE_URL}",
+        )
+        save_state({"live": version})
 
 
 async def main() -> None:
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        print(f"[{now()}] Tracking app {APP_ID}, checking every {POLL_SECONDS}s")
+        print(f"[{now()}] Tracking {GAME_NAME}, checking every {POLL_SECONDS}s")
         while True:
             await check_once(session)
             await asyncio.sleep(POLL_SECONDS)
