@@ -8,9 +8,10 @@ from typing import Optional
 
 import aiohttp
 
-ACCESS_TOKEN = "OC|752908224809889|"
-APP_ID = 7190422614401072
-DOCID = 6771539532935162
+# Override these in Railway variables if Meta rotates them.
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "OC|752908224809889|")
+APP_ID = int(os.environ.get("APP_ID", "7190422614401072"))  # Animal Company
+DOCID = os.environ.get("DOCID", "6771539532935162")
 
 URL = "https://graph.oculus.com/graphql"
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "600"))  # default: 10 minutes
@@ -91,6 +92,11 @@ async def check_once(session: aiohttp.ClientSession) -> None:
         return
 
     current = {"live": live_version(meta), "dev": dev_version(meta)}
+
+    if not any(current.values()):
+        # Request worked but the response shape didn't match: show it so we can adapt.
+        print(f"[{now()}] No versions found. Response: {json.dumps(meta)[:1500]}")
+        return
     state = load_state()
 
     # First run: record a baseline.
